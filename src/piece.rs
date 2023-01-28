@@ -44,7 +44,7 @@ impl Piece {
         }
     }
 
-    pub fn get_image(&self) -> &str {
+    pub fn get_image(&self) -> String {
         match self {
             Piece::I => "img/red.png",
             Piece::L => "img/purple.png",
@@ -52,7 +52,7 @@ impl Piece {
             Piece::O => "img/yellow.png",
             Piece::S => "img/cyan.png",
             Piece::Z => "img/green.png",
-        }
+        }.to_string()
     }
 
     pub fn get_random() -> Piece {
