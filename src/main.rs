@@ -1,8 +1,9 @@
-use std::clone::Clone;
 use std::time::Duration;
 
 use bevy::prelude::*;
 use bevy::sprite::MaterialMesh2dBundle;
+use bevy::text::Text2dBounds;
+use derive_more::Constructor;
 use rand::prelude::thread_rng;
 use rand::Rng;
 
@@ -20,23 +21,56 @@ fn main() {
         .add_event::<ReachedFloorEvent>()
         .add_event::<AreaClearedEvent>()
         .add_event::<NewPositionEvent>()
+        .add_event::<NewPieceEvent>()
         .add_system(descend_piece)
         .add_system(clear_room.before(descend_piece))
         .add_system(spawn_on_clear)
         .add_system(rotate_piece)
         .add_system(move_sideways)
         .add_system(draw_piece)
+        .add_system(draw_preview)
+        .add_system(update_score)
+        .add_system(bevy::window::close_on_esc)
         .run();
 }
 
-#[derive(Resource)]
-struct PiecePosition(Piece, u8, i32, i32, bool);
+#[derive(Resource, Constructor)]
+struct Preview {
+    piece: Piece,
+    angle: u8,
+}
+
+#[derive(Resource, Constructor)]
+struct PiecePosition {
+    piece: Piece,
+    angle: u8,
+    x: i32,
+    y: i32,
+    is_visible: bool,
+}
+
+#[derive(Component)]
+struct PreviewSprite;
 
 #[derive(Component)]
 struct PieceSprite;
 
 #[derive(Component)]
-struct RockSprite(i32, i32);
+struct ScoreBoard;
+
+#[derive(Component, Constructor)]
+struct RockSprite {
+    x: i32,
+    y: i32,
+    color: Piece,
+}
+
+#[derive(Resource, Constructor)]
+struct GameState {
+    level: i32,
+    score: i32,
+    descend_sleep: Duration,
+}
 
 #[derive(Resource)]
 struct LastDownPress(Duration);
@@ -61,6 +95,9 @@ struct AreaClearedEvent;
 
 #[derive(Default)]
 struct NewPositionEvent;
+
+#[derive(Default)]
+struct NewPieceEvent;
 
 #[derive(Resource)]
 struct GameOver(bool);
@@ -88,32 +125,61 @@ fn setup(
 
     commands.spawn(MaterialMesh2dBundle {
         mesh: meshes.add(Mesh::from(shape::Quad::default())).into(),
-        transform: Transform::from_translation(find_translation(0., 0., 0.1, GAME_AREA.x, GAME_AREA.y))
-            .with_scale(Vec3::from((GAME_AREA, 0.))),
+        transform: calculate_transform(0., 0., 0.1, GAME_AREA.x, GAME_AREA.y),
         material: materials.add(ColorMaterial::from(Color::BLACK)),
         ..default()
     });
 
-    commands.insert_resource(PiecePosition(Piece::O, 0, 0, 0, false));
+    commands.spawn(MaterialMesh2dBundle {
+        mesh: meshes.add(Mesh::from(shape::Quad::default())).into(),
+        transform: calculate_transform(
+            PREVIEW_CORNER.x,
+            PREVIEW_CORNER.y,
+            0.1,
+            PREVIEW_AREA.x,
+            PREVIEW_AREA.y,
+        ),
+        material: materials.add(ColorMaterial::from(Color::BLACK)),
+        ..default()
+    });
+
+    commands.insert_resource(Preview::new(
+        Piece::get_random(),
+        thread_rng().gen::<u8>() % 4,
+    ));
+    commands.insert_resource(PiecePosition::new(Piece::O, 0, 0, 0, false));
     commands.insert_resource(LastDownPress(Duration::from_secs(0)));
     commands.insert_resource(LastSidePress(Duration::from_secs(0)));
     commands.insert_resource(LastUpPress(false));
     commands.insert_resource(LastSpacePress(false));
     commands.insert_resource(FirstSpawnDone(false));
     commands.insert_resource(GameOver(false));
+    commands.insert_resource(GameState::new(
+        1,
+        0,
+        Duration::from_millis(INITIAL_DESCEND_SLEEP),
+    ));
 }
 
 fn first_spawn(
     commands: Commands,
     asset_server: Res<AssetServer>,
     position: ResMut<PiecePosition>,
-    rock_query: Query<&RockSprite>,
+    preview: ResMut<Preview>,
     mut first_spawn_done: ResMut<FirstSpawnDone>,
-    game_over: ResMut<GameOver>,
+    new_piece_writer: EventWriter<NewPieceEvent>,
+    game_over: Res<GameOver>,
 ) {
     if !first_spawn_done.0 {
         first_spawn_done.0 = true;
-        spawn_new_piece(commands, asset_server, position, rock_query, game_over);
+        spawn_new_piece(
+            commands,
+            asset_server,
+            position,
+            preview,
+            game_over,
+            new_piece_writer,
+        );
     }
 }
 
@@ -121,13 +187,21 @@ fn spawn_on_clear(
     commands: Commands,
     asset_server: Res<AssetServer>,
     position: ResMut<PiecePosition>,
-    rock_query: Query<&RockSprite>,
+    preview: ResMut<Preview>,
     area_cleared_reader: EventReader<AreaClearedEvent>,
-    game_over: ResMut<GameOver>,
+    new_piece_writer: EventWriter<NewPieceEvent>,
+    game_over: Res<GameOver>,
 ) {
     if !area_cleared_reader.is_empty() {
         area_cleared_reader.clear();
-        spawn_new_piece(commands, asset_server, position, rock_query, game_over);
+        spawn_new_piece(
+            commands,
+            asset_server,
+            position,
+            preview,
+            game_over,
+            new_piece_writer,
+        );
     }
 }
 
@@ -135,60 +209,68 @@ fn spawn_new_piece(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut position: ResMut<PiecePosition>,
-    rock_query: Query<&RockSprite>,
-    mut game_over: ResMut<GameOver>,
+    mut preview: ResMut<Preview>,
+    game_over: Res<GameOver>,
+    mut new_piece_writer: EventWriter<NewPieceEvent>,
 ) {
-    let piece = Piece::get_random();
+    if game_over.0 {
+        return;
+    }
+    position.piece = preview.piece.clone();
+    position.angle = preview.angle.clone();
+    position.x = HORIZONTAL_TILES as i32 / 2 - 1;
+    position.y = -5;
+    position.is_visible = true;
 
-    position.0 = piece;
-    position.1 = thread_rng().gen::<u8>() % 4;
-    position.2 = HORIZONTAL_TILES as i32 / 2 - 1;
-    position.3 = -5;
-    position.4 = true;
+    preview.piece = Piece::get_random();
+    preview.angle = thread_rng().gen::<u8>() % 4;
 
-    let mut new_tiles = position.0.get_tiles(position.1, position.2, position.3);
+    let mut new_tiles = position
+        .piece
+        .get_tiles(position.angle, position.x, position.y);
 
     loop {
-        let offer_tiles = position.0.get_tiles(position.1, position.2, position.3 + 1);
+        let offer_tiles = position
+            .piece
+            .get_tiles(position.angle, position.x, position.y + 1);
         let mut is_visible = false;
         for i in 0..new_tiles.len() {
             if offer_tiles[i].1 >= 0 {
                 is_visible = true;
-                break
+                break;
             }
         }
         if is_visible {
             break;
         }
-        position.3 = position.3 + 1;
+        position.y = position.y + 1;
         new_tiles = offer_tiles;
     }
 
-    let rocks: Vec<&RockSprite> = rock_query.iter().collect();
-    for i in 0..new_tiles.len() {
-        let tile = new_tiles[i];
-        if collision(&position.0, &position.1, &tile.0, &tile.1, &rocks) == CollisionType::Floor {
-            info!("Game Over");
-            game_over.0 = true;
-            return;
-        }
-    }
-
     place_piece(&mut commands, asset_server, position, new_tiles);
+
+    new_piece_writer.send_default();
 }
 
-fn place_piece(commands: &mut Commands, asset_server: Res<AssetServer>, mut position: ResMut<PiecePosition>, new_tiles: Vec<(i32, i32)>) {
+fn place_piece(
+    commands: &mut Commands,
+    asset_server: Res<AssetServer>,
+    position: ResMut<PiecePosition>,
+    new_tiles: Vec<(i32, i32)>,
+) {
     for i in 0..new_tiles.len() {
         let tile = new_tiles[i];
-        let color = asset_server.load(position.0.get_image());
-        commands.spawn((PieceSprite, SpriteBundle {
-            texture: color,
-            visibility: Visibility {
-                is_visible: tile.1 >= 0,
+        commands.spawn((
+            PieceSprite,
+            SpriteBundle {
+                texture: position.piece.get_image(&asset_server),
+                visibility: Visibility {
+                    is_visible: tile.1 >= 0,
+                },
+                transform: tile_transform(tile),
+                ..default()
             },
-            transform: Transform::from_translation(tile_translation(tile)),
-            ..default()
-        }));
+        ));
     }
 }
 
@@ -196,15 +278,15 @@ fn descend_piece(
     mut commands: Commands,
     mut position: ResMut<PiecePosition>,
     asset_server: Res<AssetServer>,
-    mut piece_query: Query<(&PieceSprite, Entity)>,
-    rock_query: Query<(&RockSprite, Entity)>,
-    time: Res<Time>,
+    game_state: Res<GameState>,
+    mut game_over: ResMut<GameOver>,
     mut last_click: ResMut<LastDownPress>,
     keyboard_input: Res<Input<KeyCode>>,
     mut last_space: ResMut<LastSpacePress>,
+    time: Res<Time>,
+    rock_query: Query<(&RockSprite, Entity)>,
     mut reached_floor_writer: EventWriter<ReachedFloorEvent>,
     mut new_position_writer: EventWriter<NewPositionEvent>,
-    game_over: ResMut<GameOver>,
 ) {
     if game_over.0 {
         return;
@@ -220,34 +302,51 @@ fn descend_piece(
 
     let since_click = time.elapsed() - last_click.0;
     if space_pressed
-        || since_click >= Duration::from_millis(1000)
-        || (keyboard_input.pressed(KeyCode::Down) && since_click >= Duration::from_millis(100)) {
-
+        || since_click >= game_state.descend_sleep
+        || (keyboard_input.pressed(KeyCode::Down)
+            && since_click >= Duration::from_millis(DOWN_MOVE_SLEEP))
+    {
         last_click.0 = time.elapsed();
 
         let rocks_entities: Vec<(&RockSprite, Entity)> = rock_query.iter().collect();
         let rocks: Vec<&RockSprite> = rocks_entities.iter().map(|pair| pair.0).collect();
         loop {
-            let new_y = position.3 + 1;
+            let new_y = position.y + 1;
 
-            if collision(&position.0, &position.1, &position.2, &new_y, &rocks) == CollisionType::Floor {
-                for (_, entity) in piece_query.iter_mut() {
-                    commands.entity(entity).despawn();
+            if collision(
+                &position.piece,
+                &position.angle,
+                &position.x,
+                &new_y,
+                &rocks,
+            ) == CollisionType::Floor
+            {
+                info!("Floor at x={} y={}", position.x, position.y);
+
+                let mut rock_out_of_bounds = false;
+                for (x, y) in position
+                    .piece
+                    .get_tiles(position.angle, position.x, position.y)
+                {
+                    if y < 0 {
+                        rock_out_of_bounds = true;
+                    }
+                    spawn_rock(&mut commands, &asset_server, x, y, &position.piece);
                 }
 
-                for (x, y) in  position.0.get_tiles(position.1, position.2, position.3) {
-                    spawn_rock(&mut commands, &asset_server, x, y);
+                if rock_out_of_bounds {
+                    game_over.0 = true;
+                    info!("Game Over!");
                 }
 
-                position.4 = false;
+                position.is_visible = false;
                 reached_floor_writer.send_default();
 
-                info!("Floor at x={} y={}", position.2, position.3);
                 break;
             } else {
-                position.3 = new_y;
+                position.y = new_y;
                 new_position_writer.send_default();
-                info!("New x={} y={}", position.2, new_y);
+                info!("New x={} y={}", position.x, new_y);
             }
 
             if !space_pressed {
@@ -257,39 +356,64 @@ fn descend_piece(
     }
 }
 
-fn spawn_rock(commands: &mut Commands, asset_server: &Res<AssetServer>, x: i32, y: i32) {
-    commands.spawn((RockSprite(x, y), SpriteBundle {
-        texture: asset_server.load("img/grey.png"),
-        transform: Transform::from_translation(tile_translation((x, y))),
-        ..default()
-    }));
+fn spawn_rock(
+    commands: &mut Commands,
+    asset_server: &Res<AssetServer>,
+    x: i32,
+    y: i32,
+    color: &Piece,
+) {
+    commands.spawn((
+        RockSprite::new(x, y, color.clone()),
+        SpriteBundle {
+            texture: color.get_image(&asset_server),
+            transform: tile_transform((x, y)),
+            visibility: Visibility { is_visible: y >= 0 },
+            ..default()
+        },
+    ));
 }
 
 fn clear_room(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
+    mut game_state: ResMut<GameState>,
+    mut rock_query: Query<(&RockSprite, Entity)>,
     reached_floor_reader: EventReader<ReachedFloorEvent>,
     mut area_cleared_writer: EventWriter<AreaClearedEvent>,
-    mut rock_query: Query<(&RockSprite, Entity)>,
 ) {
     if !reached_floor_reader.is_empty() {
         reached_floor_reader.clear();
 
-        let rocks = rock_query.iter_mut().collect::<Vec<(&RockSprite, Entity)>>();
+        let rocks = rock_query
+            .iter_mut()
+            .collect::<Vec<(&RockSprite, Entity)>>();
 
         let mut line_edits = vec![0; VERTICAL_TILES as usize];
         let mut line_counts = vec![0; VERTICAL_TILES as usize];
+        let mut cleared = 0;
 
         for i in 0..rocks.len() {
             let rock = rocks[i].0;
-            if rock.1 >= 0 {
-                let y = rock.1 as usize;
+            if rock.y >= 0 {
+                let y = rock.y as usize;
                 line_counts[y] += 1;
                 if line_counts[y] == HORIZONTAL_TILES {
                     line_edits[y] = -1;
+                    cleared += 1;
                 }
             }
         }
+
+        game_state.score += game_state.level
+            * match cleared {
+                0 => 0,
+                1 => 100,
+                2 => 300,
+                3 => 500,
+                4 => 800,
+                _ => 0,
+            };
 
         let mut remove = 0;
         for i in (0..VERTICAL_TILES as usize).rev() {
@@ -303,15 +427,15 @@ fn clear_room(
         for i in 0..rocks.len() {
             let rock = rocks[i].0;
             let entity = rocks[i].1;
-            if rock.1 >= 0 {
-                let edit = line_edits[rock.1 as usize];
+            if rock.y >= 0 {
+                let edit = line_edits[rock.y as usize];
                 if edit == -1 {
                     commands.entity(entity).despawn();
                 } else if edit > 0 {
                     commands.entity(entity).despawn();
-                    let x = rock.0;
-                    let y = rock.1 + edit;
-                    spawn_rock(&mut commands, &asset_server, x, y);
+                    let x = rock.x;
+                    let y = rock.y + edit;
+                    spawn_rock(&mut commands, &asset_server, x, y, &rock.color);
                 }
             }
         }
@@ -335,7 +459,7 @@ fn collision(
         }
 
         for rock in rocks {
-            if new_x == rock.0 && new_y == rock.1 {
+            if new_x == rock.x && new_y == rock.y {
                 return CollisionType::Floor;
             }
         }
@@ -355,20 +479,76 @@ fn collision(
 fn draw_piece(
     mut commands: Commands,
     position: ResMut<PiecePosition>,
-    sprite_query: Query<(&PieceSprite, &mut Transform, &mut Visibility, Entity)>,
+    sprite_query: Query<(&PieceSprite, Entity)>,
     new_position_reader: EventReader<NewPositionEvent>,
     asset_server: Res<AssetServer>,
 ) {
     if !new_position_reader.is_empty() {
         new_position_reader.clear();
 
-        sprite_query.for_each(|(piece, mut transform, visibility, entity)| {
+        sprite_query.for_each(|(_, entity)| {
             commands.entity(entity).despawn();
         });
 
-        if position.4 {
-            let coords = position.0.get_tiles(position.1, position.2, position.3);
+        if position.is_visible {
+            let coords = position
+                .piece
+                .get_tiles(position.angle, position.x, position.y);
             place_piece(&mut commands, asset_server, position, coords);
+        }
+    }
+}
+
+fn draw_preview(
+    mut commands: Commands,
+    preview: Res<Preview>,
+    sprite_query: Query<(&PreviewSprite, Entity)>,
+    new_piece_reader: EventReader<NewPieceEvent>,
+    asset_server: Res<AssetServer>,
+) {
+    if !new_piece_reader.is_empty() {
+        new_piece_reader.clear();
+
+        sprite_query.for_each(|(_, entity)| {
+            commands.entity(entity).despawn();
+        });
+
+        let tiles = preview.piece.get_tiles(preview.angle, 0, 0);
+
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+
+        for i in 0..tiles.len() {
+            max_x = max_x.max(tiles[i].0);
+            max_y = max_y.max(tiles[i].1);
+            min_x = min_x.min(tiles[i].0);
+            min_y = min_y.min(tiles[i].1);
+        }
+
+        let d_left = MARGIN + TILE_SIZE * min_x as f32;
+        let d_top = MARGIN + TILE_SIZE * min_y as f32;
+        let d_right = MARGIN + TILE_SIZE * (PREVIEW_TILES - max_x - 1) as f32;
+        let d_bottom = MARGIN + TILE_SIZE * (PREVIEW_TILES - max_y - 1) as f32;
+
+        let horizontal_margin = (d_left + d_right) / 2.0;
+        let vertical_margin = (d_top + d_bottom) / 2.0;
+
+        for i in 0..tiles.len() {
+            let tile = tiles[i];
+            commands.spawn((
+                PreviewSprite,
+                SpriteBundle {
+                    texture: preview.piece.get_image(&asset_server),
+                    transform: preview_tile_translation(
+                        tile,
+                        horizontal_margin - d_left,
+                        vertical_margin - d_top,
+                    ),
+                    ..default()
+                },
+            ));
         }
     }
 }
@@ -384,37 +564,45 @@ fn rotate_piece(
         last_click.0 = false;
     } else if !last_click.0 && keyboard_input.pressed(KeyCode::Up) {
         last_click.0 = true;
-        let new_angle = (position.1 + 1) % 4;
-        let mut new_x = position.2;
+        let new_angle = (position.angle + 1) % 4;
+        let mut new_x = position.x;
 
         let rocks: Vec<&RockSprite> = rock_query.iter().map(|pair| pair.0).collect();
 
-        let mut collision_type = collision(&position.0, &new_angle, &position.2, &position.3, &rocks);
+        let mut collision_type = collision(
+            &position.piece,
+            &new_angle,
+            &position.x,
+            &position.y,
+            &rocks,
+        );
 
         let mut accepted = false;
         if collision_type == CollisionType::None {
-            position.1 = new_angle;
+            position.angle = new_angle;
             accepted = true;
         } else if collision_type == CollisionType::RightWall {
-            new_x = position.2 - 1;
-            collision_type = collision(&position.0, &new_angle, &new_x, &position.3, &rocks);
+            new_x = position.x - 1;
+            collision_type = collision(&position.piece, &new_angle, &new_x, &position.y, &rocks);
             if collision_type == CollisionType::None {
                 accepted = true;
             } else {
-                new_x = position.2 - 2;
-                collision_type = collision(&position.0, &new_angle, &new_x, &position.3, &rocks);
+                new_x = position.x - 2;
+                collision_type =
+                    collision(&position.piece, &new_angle, &new_x, &position.y, &rocks);
                 if collision_type == CollisionType::None {
                     accepted = true;
                 }
             }
         } else if collision_type == CollisionType::LeftWall {
-            new_x = position.2 + 1;
-            collision_type = collision(&position.0, &new_angle, &new_x, &position.3, &rocks);
+            new_x = position.x + 1;
+            collision_type = collision(&position.piece, &new_angle, &new_x, &position.y, &rocks);
             if collision_type == CollisionType::None {
                 accepted = true;
             } else {
-                new_x = position.2 + 2;
-                collision_type = collision(&position.0, &new_angle, &new_x, &position.3, &rocks);
+                new_x = position.x + 2;
+                collision_type =
+                    collision(&position.piece, &new_angle, &new_x, &position.y, &rocks);
                 if collision_type == CollisionType::None {
                     accepted = true;
                 }
@@ -422,11 +610,10 @@ fn rotate_piece(
         }
 
         if accepted {
-            position.1 = new_angle;
-            position.2 = new_x;
+            position.angle = new_angle;
+            position.x = new_x;
             new_position_writer.send_default();
         }
-
     }
 }
 
@@ -439,7 +626,7 @@ fn move_sideways(
     mut new_position_writer: EventWriter<NewPositionEvent>,
 ) {
     let since_click = time.elapsed() - last_click.0;
-    if since_click < Duration::from_millis(100) {
+    if since_click < Duration::from_millis(LEFT_RIGHT_MOVE_SLEEP) {
         return;
     }
 
@@ -451,15 +638,59 @@ fn move_sideways(
     }
 
     if delta_x != 0 {
-        let new_x = position.2 + delta_x;
+        let new_x = position.x + delta_x;
 
         let rocks: Vec<&RockSprite> = rock_query.iter().map(|pair| pair.0).collect();
 
-        if collision(&position.0, &position.1, &new_x, &position.3, &rocks) == CollisionType::None {
-            position.2 = new_x;
+        if collision(
+            &position.piece,
+            &position.angle,
+            &new_x,
+            &position.y,
+            &rocks,
+        ) == CollisionType::None
+        {
+            position.x = new_x;
             last_click.0 = time.elapsed();
             new_position_writer.send_default();
         }
     }
+}
 
+fn update_score(
+    mut commands: Commands,
+    game_state: Res<GameState>,
+    mut score_board_query: Query<(&ScoreBoard, Entity)>,
+    asset_server: Res<AssetServer>,
+) {
+    let font = asset_server.load("fonts/FiraSans-Bold.ttf");
+    let text_style = TextStyle {
+        font,
+        font_size: SCORE_BOARD_HEIGHT,
+        color: Color::WHITE,
+    };
+    score_board_query
+        .iter_mut()
+        .for_each(|(_, entity)| commands.entity(entity).despawn());
+    commands.spawn((
+        ScoreBoard,
+        Text2dBundle {
+            text: Text::from_section(game_state.score.to_string(), text_style)
+                .with_alignment(TextAlignment::CENTER),
+            text_2d_bounds: Text2dBounds {
+                size: Vec2::new(SCORE_BOARD_WIDTH, SCORE_BOARD_HEIGHT),
+            },
+            transform: Transform {
+                translation: calculate_translation(
+                    PREVIEW_CORNER.x,
+                    PREVIEW_CORNER.y + (1. + PREVIEW_TILES as f32) * TILE_SIZE + 2. * MARGIN,
+                    2.,
+                    SCORE_BOARD_WIDTH,
+                    SCORE_BOARD_HEIGHT,
+                ),
+                ..default()
+            },
+            ..default()
+        },
+    ));
 }
